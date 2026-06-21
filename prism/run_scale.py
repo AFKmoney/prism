@@ -36,7 +36,9 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from prism.baselines import build_model
 from prism.config import PrismConfig
+from prism.curriculum import CurriculumSchedule, TokenRecycler
 from prism.data_scale import Batch, _load_tokenizer, build_dataloader, batched
+from prism.modular import MIX_MODULAR, assemble_experts, modular_config
 from prism.train_scale import PRESETS, TrainArgs, get_mix, mix_summary
 
 
@@ -105,7 +107,34 @@ def train(args: TrainArgs):
 
     # --- Model ---
     cfg: PrismConfig = PRESETS[args.preset](vocab_size=vocab_size)
+
+    # Modular pretraining: either isolate one expert kind or assemble three.
+    if args.modular_phase in ("neural", "memory", "symbolic"):
+        cfg = modular_config(cfg, args.modular_phase)
+        if is_main:
+            print(f"[modular] isolated expert kind: {args.modular_phase} "
+                  f"(expert_types={cfg.expert_types}, layers={cfg.num_layers})")
+    elif args.modular_phase == "assemble":
+        # Will be handled after model construction (needs the full model).
+        if is_main:
+            print("[modular] assemble mode: full model, experts loaded from checkpoints")
+
     model = build_model("prism", cfg).to(device=device, dtype=dtype)
+
+    # Assemble: load three single-expert checkpoints into the full model.
+    if args.modular_phase == "assemble":
+        if not all([args.modular_neural_ckpt, args.modular_symbolic_ckpt]):
+            raise SystemExit("--modular-phase assemble requires --modular-neural-ckpt "
+                             "and --modular-symbolic-ckpt (memory optional)")
+        assemble_experts(
+            model,
+            neural_ckpt=args.modular_neural_ckpt,
+            symbolic_ckpt=args.modular_symbolic_ckpt,
+            memory_ckpt=args.modular_memory_ckpt,
+        )
+        if is_main:
+            print(f"[modular] assembled experts from checkpoints; "
+                  f"router+MRB at fresh init for fine-tune")
     if args.grad_checkpoint and hasattr(model, "gradient_checkpointing_enable"):
         try:
             model.gradient_checkpointing_enable()
@@ -173,10 +202,55 @@ def train(args: TrainArgs):
             ]
         if is_main:
             print(f"[smoke] using tiny datasets: {[d.path for d in mix]}")
+    elif args.modular_phase in ("neural", "memory", "symbolic"):
+        # Modular pretraining: use the expert-focused mix for this phase.
+        mix = MIX_MODULAR[args.modular_phase]
+        if is_main:
+            print(f"[modular] focused mix for {args.modular_phase}:\n{mix_summary(mix)}")
     else:
         mix = get_mix(args.phase)
+
+    # Curriculum: build a schedule and a function that returns the current mix.
+    # We approximate the time-varying weights by *rebuilding* the dataloader at
+    # each phase transition (3 rebuilds total). Each dataset is tagged with its
+    # expert focus so the curriculum can re-weight.
+    curriculum_sched = None
+    if args.curriculum and not args.smoke_datasets:
+        # Tag each dataset with a focus kind (best-effort mapping by content).
+        _FOCUS_MAP = {
+            "HuggingFaceFW/fineweb-edu": "neural",
+            "togethercomputer/RedPajama-Data-1T-Sample": "memory",
+            "open-web-math/open-web-math": "symbolic",
+            "bigcode/the-stack-v2-train": "symbolic",
+        }
+        focuses = [_FOCUS_MAP.get(d.path, "neural") for d in mix]
+        base_weights = [d.weight for d in mix]
+        curriculum_sched = CurriculumSchedule(total_steps=args.steps)
+        if is_main:
+            print(f"[curriculum] 3-phase schedule, focuses={focuses}")
+
+    def current_mix_for_step(step: int):
+        """Return (mix_list, rebuild_needed). If curriculum is off, mix is static."""
+        if curriculum_sched is None:
+            return mix, False
+        new_weights = curriculum_sched.weights_for_step(step, base_weights, focuses)
+        from dataclasses import replace as _replace
+
+        reborn = [_replace(d, weight=w) for d, w in zip(mix, new_weights)]
+        phase = curriculum_sched.phase_for_step(step)
+        return reborn, phase
+
+    # Token recycler (loss-side weighting).
+    recycler = None
+    if args.token_recycling:
+        recycler = TokenRecycler(strength=args.recycling_strength, device=device)
+        if is_main:
+            print(f"[recycling] enabled, strength={args.recycling_strength}")
+
+    # Build the initial dataloader.
     stream = build_dataloader(mix, tokenizer, args.seq_len, args.micro_batch_size, seed=args.seed)
     batches = batched(stream, args.micro_batch_size)
+    last_phase = None
 
     # --- Train loop ---
     autocast_ctx = (
@@ -191,6 +265,17 @@ def train(args: TrainArgs):
     running_loss = 0.0
 
     for step in range(start_step, args.steps):
+        # Curriculum: rebuild the dataloader when the phase changes.
+        if curriculum_sched is not None:
+            phase = curriculum_sched.phase_for_step(step)
+            if phase != last_phase:
+                if is_main:
+                    print(f"[curriculum] step {step}: entering {phase} phase, rebuilding dataloader")
+                cur_mix, _ = current_mix_for_step(step)
+                stream = build_dataloader(cur_mix, tokenizer, args.seq_len, args.micro_batch_size, seed=args.seed + step)
+                batches = batched(stream, args.micro_batch_size)
+                last_phase = phase
+
         batch: Batch = next(batches)
         input_ids = batch.input_ids.to(device)
         labels = batch.labels.to(device)
@@ -201,11 +286,26 @@ def train(args: TrainArgs):
             # Standard causal LM: predict token t+1 from t.
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+
+            if recycler is not None:
+                # Per-token loss + recycling weights (loss-side injection).
+                B = shift_labels.size(0)
+                Tm1 = shift_labels.size(1)
+                V = shift_logits.size(-1)
+                per_tok = F.cross_entropy(
+                    shift_logits.view(-1, V), shift_labels.view(-1),
+                    reduction="none", ignore_index=-100,
+                ).reshape(B, Tm1)
+                weights = recycler.token_weights(per_tok)
+                denom = (weights * (shift_labels != -100).float().reshape(B, Tm1)).sum().clamp(min=1.0)
+                loss = (per_tok * weights).sum() / denom
+                recycler.update(per_tok.detach())
+            else:
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
             loss = loss + getattr(out, "aux_loss", torch.zeros((), device=device))
             loss = loss / args.grad_accum_steps
 
@@ -278,6 +378,21 @@ def main(argv=None):
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--init-from", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
+    # --- levers ---
+    p.add_argument("--modular-phase", choices=["neural", "memory", "symbolic", "assemble"],
+                   default=None, help="train one expert kind in isolation, or assemble 3")
+    p.add_argument("--modular-neural-ckpt", type=str, default=None,
+                   help="checkpoint dir for assemble mode (neural expert)")
+    p.add_argument("--modular-symbolic-ckpt", type=str, default=None,
+                   help="checkpoint dir for assemble mode (symbolic expert)")
+    p.add_argument("--modular-memory-ckpt", type=str, default=None,
+                   help="checkpoint dir for assemble mode (memory expert, optional)")
+    p.add_argument("--curriculum", action="store_true",
+                   help="3-phase dataset re-weighting (neural->memory->symbolic)")
+    p.add_argument("--token-recycling", action="store_true",
+                   help="up-weight hard tokens (enable >=1B tokens)")
+    p.add_argument("--recycling-strength", type=float, default=1.0,
+                   help="0=off, 1=full inverse-freq weighting")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default="prism")
     p.add_argument(
@@ -304,12 +419,19 @@ def main(argv=None):
         init_from=cli.init_from,
         seed=cli.seed,
         tokenizer=cli.tokenizer,
+        modular_phase=cli.modular_phase,
+        curriculum=cli.curriculum,
+        token_recycling=cli.token_recycling,
+        recycling_strength=cli.recycling_strength,
         wandb=cli.wandb,
         wandb_project=cli.wandb_project,
     )
-    # Stash the --cpu flag.
+    # Stash runtime-only flags.
     args.force_cpu = cli.cpu or cli.smoke
     args.smoke_datasets = cli.smoke
+    args.modular_neural_ckpt = cli.modular_neural_ckpt
+    args.modular_symbolic_ckpt = cli.modular_symbolic_ckpt
+    args.modular_memory_ckpt = cli.modular_memory_ckpt
 
     if cli.wandb and is_main_process(int(os.environ.get("WORLD_SIZE", "1"))):
         try:

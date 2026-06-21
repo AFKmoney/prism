@@ -268,8 +268,14 @@ class TrainArgs:
     """Training hyperparameters, decoupled from model config."""
 
     # --- scale ---
-    preset: str = "1b"                  # 1b | 350m | tiny
+    preset: str = "1b"                  # 1b | 350m | 300m | tiny
     phase: str = "pretrain"             # pretrain | instruct
+
+    # --- levers (opt-in, each measurable in isolation) ---
+    modular_phase: str | None = None    # None | neural | memory | symbolic | assemble
+    curriculum: bool = False            # 3-phase dataset re-weighting (neural→memory→symbolic)
+    token_recycling: bool = False       # up-weight hard tokens (enable >=1B tokens)
+    recycling_strength: float = 1.0     # 0=off, 1=full inverse-freq weighting
 
     # --- data ---
     seq_len: int = 4096
